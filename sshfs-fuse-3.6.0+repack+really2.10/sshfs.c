@@ -52,6 +52,7 @@
 #endif
 
 #include "cache.h"
+#include "filter.h"
 
 #ifndef MAP_LOCKED
 #define MAP_LOCKED 0
@@ -212,6 +213,8 @@ struct sshfs {
 	char *ssh_command;
 	char *sftp_server;
 	struct fuse_args ssh_args;
+	char *filter_file;
+	int filter_enabled;
 	char *workarounds;
 	int rename_workaround;
 	int truncate_workaround;
@@ -288,6 +291,10 @@ struct sshfs {
 };
 
 static struct sshfs sshfs;
+struct filtered_dir_context {
+    fuse_cache_dirh_t h;
+    fuse_cache_dirfil_t filler;
+};
 
 static const char *ssh_opts[] = {
 	"AddressFamily",
@@ -403,6 +410,8 @@ static struct fuse_opt sshfs_opts[] = {
 	SSHFS_OPT("delay_connect",     delay_connect, 1),
 	SSHFS_OPT("slave",             slave, 1),
 	SSHFS_OPT("disable_hardlink",  disable_hardlink, 1),
+	SSHFS_OPT("filter_from=%s",    filter_file, 0),
+	SSHFS_OPT("filter_enabled=%d", filter_enabled, 0),
 
 	FUSE_OPT_KEY("-p ",            KEY_PORT),
 	FUSE_OPT_KEY("-C",             KEY_COMPRESS),
@@ -1886,6 +1895,7 @@ static int sftp_request(uint8_t type, const struct buffer *buf,
 	return sftp_request_iov(type, &iov, 1, expect_type, outbuf);
 }
 
+#if 0
 static int sshfs_getattr(const char *path, struct stat *stbuf)
 {
 	int err;
@@ -1905,6 +1915,33 @@ static int sshfs_getattr(const char *path, struct stat *stbuf)
 	buf_free(&buf);
 	return err;
 }
+#else
+static int sshfs_getattr(const char *path, struct stat *stbuf)
+{
+    int err;
+    struct buffer buf;
+    struct buffer outbuf;
+    
+    /* Check filter before accessing */
+    if (sshfs.filter_enabled && filter_check_path(path)) {
+        return -ENOENT;
+    }
+    
+    buf_init(&buf, 0);
+    buf_add_path(&buf, path);
+    err = sftp_request(sshfs.follow_symlinks ? SSH_FXP_STAT : SSH_FXP_LSTAT,
+                       &buf, SSH_FXP_ATTRS, &outbuf);
+    if (!err) {
+        err = buf_get_attrs(&outbuf, stbuf, NULL);
+#ifdef __APPLE__
+        stbuf->st_blksize = 0;
+#endif
+        buf_free(&outbuf);
+    }
+    buf_free(&buf);
+    return err;
+}
+#endif
 
 static int sshfs_access(const char *path, int mask)
 {
@@ -2133,6 +2170,7 @@ static int sftp_readdir_sync(struct buffer *handle, fuse_cache_dirh_t h,
 	return err;
 }
 
+#if 0
 static int sshfs_getdir(const char *path, fuse_cache_dirh_t h,
                         fuse_cache_dirfil_t filler)
 {
@@ -2159,6 +2197,70 @@ static int sshfs_getdir(const char *path, fuse_cache_dirh_t h,
 	buf_free(&buf);
 	return err;
 }
+#else
+/* Structure to hold filtered directory context */
+struct filtered_dir_ctx {
+    fuse_cache_dirh_t h;
+    fuse_cache_dirfil_t filler;
+};
+
+/* Wrapper for directory filler that filters entries */
+static int filter_dir_filler(fuse_cache_dirh_t h, const char *name,
+                              const struct stat *stbuf)
+{
+    struct filtered_dir_ctx *ctx = (struct filtered_dir_ctx *)h;
+    
+    /* Apply filter rules */
+    if (sshfs.filter_enabled && filter_check(name)) {
+        /* Skip this entry */
+        return 0;
+    }
+    
+    /* Pass through to original filler */
+    return ctx->filler(ctx->h, name, stbuf);
+}
+
+static int sshfs_getdir(const char *path, fuse_cache_dirh_t h,
+                        fuse_cache_dirfil_t filler)
+{
+    int err;
+    struct buffer buf;
+    struct buffer handle;
+    
+    buf_init(&buf, 0);
+    buf_add_path(&buf, path);
+    err = sftp_request(SSH_FXP_OPENDIR, &buf, SSH_FXP_HANDLE, &handle);
+    if (!err) {
+        int err2;
+        buf_finish(&handle);
+        
+        if (sshfs.filter_enabled && sshfs.filter_file) {
+            struct filtered_dir_ctx ctx;
+            ctx.h = h;
+            ctx.filler = filler;
+            
+            if (sshfs.sync_readdir)
+                err = sftp_readdir_sync(&handle, (fuse_cache_dirh_t)&ctx, 
+                                        (fuse_cache_dirfil_t)filter_dir_filler);
+            else
+                err = sftp_readdir_async(&handle, (fuse_cache_dirh_t)&ctx, 
+                                         (fuse_cache_dirfil_t)filter_dir_filler);
+        } else {
+            if (sshfs.sync_readdir)
+                err = sftp_readdir_sync(&handle, h, filler);
+            else
+                err = sftp_readdir_async(&handle, h, filler);
+        }
+        
+        err2 = sftp_request(SSH_FXP_CLOSE, &handle, 0, NULL);
+        if (!err)
+            err = err2;
+        buf_free(&handle);
+    }
+    buf_free(&buf);
+    return err;
+}
+#endif
 
 static int sshfs_mkdir(const char *path, mode_t mode)
 {
@@ -3988,6 +4090,17 @@ int main(int argc, char *argv[])
 	if (res == -1)
 		exit(1);
 
+	/* Load filter rules if specified */
+	if (sshfs.filter_file) {
+		if (filter_load_from_file(sshfs.filter_file) == 0) {
+			sshfs.filter_enabled = 1;
+			fprintf(stderr, "Filter enabled with rules from: %s\n", sshfs.filter_file);
+		} else {
+			fprintf(stderr, "Warning: Failed to load filter file: %s\n", sshfs.filter_file);
+			sshfs.filter_enabled = 0;
+		}
+	}
+
 	sshfs.randseed = time(0);
 
 	if (sshfs.max_read > 65536)
@@ -4082,6 +4195,17 @@ int main(int argc, char *argv[])
 			exit(1);
 		}
 
+#if 0
+		if (sshfs.filter_file) {
+			if (filter_load_from_file(sshfs.filter_file) == 0) {
+			sshfs.filter_enabled = 1;
+			fprintf(stderr, "Filter enabled with rules from: %s\n", sshfs.filter_file);
+			} else {
+				fprintf(stderr, "Warning: Failed to load filter file: %s\n", sshfs.filter_file);
+				sshfs.filter_enabled = 0;
+			}
+		}
+#endif
 		res = fuse_daemonize(foreground);
 		if (res == -1) {
 			fuse_unmount(mountpoint, ch);
@@ -4134,6 +4258,7 @@ int main(int argc, char *argv[])
 	fuse_opt_free_args(&args);
 	fuse_opt_free_args(&sshfs.ssh_args);
 	free(sshfs.directport);
+	filter_cleanup();
 
 	return res;
 }
